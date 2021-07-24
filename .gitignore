@@ -30,3 +30,5 @@
 *.exe
 *.out
 *.app
+
+opensource_code_analysis.code-workspace
