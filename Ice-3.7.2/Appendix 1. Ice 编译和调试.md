@@ -32,7 +32,12 @@
    
    sudo make CXXFLAGS=-std=c++11 CONFIGS=cpp11-shared V=1 install
    
-   
+6. 可能需要安装的依赖包
+
+    sudo apt install libeditline-dev 
+    sudo apt-get install libedit-dev
+    sudo apt install liblmdb-dev
+
 
 ## Ice的调试
 
