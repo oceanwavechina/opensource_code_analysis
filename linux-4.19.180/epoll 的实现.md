@@ -381,7 +381,7 @@ static __poll_t ep_send_events_proc(struct eventpoll *ep, struct list_head *head
 				 * poll callback will queue them in ep->ovflist.
 				 */
                 /* 注意在这里 就是 LT ET 的 区别了
-                        其实文件设备的状态改变本身就是 level trigger 的，
+                        其实如果我们每次都检查文件设备的状态的话，那就是 level trigger 的，
                         因为如果设备是可读的话，每次调用 file->poll() 都会返回可读状态。
                     而 epoll 并不是每次轮询的，而是把状态改变的通知放到了 rdllink 里边
                         进入到 rdlink 的条件是主动把 current-task 放到设备等待队列中，
