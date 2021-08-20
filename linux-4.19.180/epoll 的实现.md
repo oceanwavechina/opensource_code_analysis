@@ -410,10 +410,118 @@ static __poll_t ep_send_events_proc(struct eventpoll *ep, struct list_head *head
 
 <br>
 
-## 5. 惊群是怎么处理的？TODO
+## 5. 惊群是怎么处理的？
 ----
 
 <br>
+
+在linux4.15 版本之后引入了 [EPOLLEXCLUSIVE](https://man7.org/linux/man-pages/man2/epoll_ctl.2.html) 选项，来解决惊群问题，这个选项的玩法是这样的：
+
+1. 如果有多个 task 在 wait 同一个设备的事件，并且这些 task 在 epoll_ctl 的时候都设置了 EPOLLEXCLUSIVE 选项。等事件触发的时候，只会返回 task 中的一个。
+
+2. 如果 task 中有的没有设置 EPOLLEXCLUSIVE ，那这些没有 EPOLLEXCLUSIVE 标记的都会被唤醒。
+
+其实核心就在 wakeup 函数里边了, 在分析 select 的实现中，知道了，当数据可读时，有如下唤醒流程：
+
+``` cpp
+tcp_data_queue()
+    |
+    | -> tcp_data_ready()
+            |
+            | -> sk->sk_data_ready(sk) ( 即：sock_def_readable)
+                    |
+                    | -> wake_up_interruptible_sync_poll() 
+                            |
+                            | -> __wake_up_sync_key((x), TASK_INTERRUPTIBLE, 1, poll_to_key(m))
+                                // 注意： 这个函数调用中 nr_exclusive 传的是1
+                                    |
+                                    | -> __wake_up_common_lock()
+                                            |
+                                            | -> __wake_up_common()
+```
+
+重点就是 ```__wake_up_common()``` 这个函数了：
+
+``` cpp
+/*
+ * The core wakeup function. Non-exclusive wakeups (nr_exclusive == 0) just
+ * wake everything up. If it's an exclusive wakeup (nr_exclusive == small +ve
+ * number) then we wake all the non-exclusive tasks and one exclusive task.
+ *
+ * There are circumstances in which we can try to wake a task which has already
+ * started to run but is not in state TASK_RUNNING. try_to_wake_up() returns
+ * zero in this (rare) case, and we handle it by continuing to scan the queue.
+ */
+static int __wake_up_common(struct wait_queue_head *wq_head, unsigned int mode,
+			int nr_exclusive, int wake_flags, void *key,
+			wait_queue_entry_t *bookmark)
+{
+	wait_queue_entry_t *curr, *next;
+	int cnt = 0;
+
+	lockdep_assert_held(&wq_head->lock);
+
+	if (bookmark && (bookmark->flags & WQ_FLAG_BOOKMARK)) {
+		curr = list_next_entry(bookmark, entry);
+
+		list_del(&bookmark->entry);
+		bookmark->flags = 0;
+	} else
+		curr = list_first_entry(&wq_head->head, wait_queue_entry_t, entry);
+
+	if (&curr->entry == &wq_head->head)
+		return nr_exclusive;
+
+	list_for_each_entry_safe_from(curr, next, &wq_head->head, entry) {
+		unsigned flags = curr->flags;
+		int ret;
+
+		if (flags & WQ_FLAG_BOOKMARK)
+			continue;
+
+		ret = curr->func(curr, mode, wake_flags, key);
+		if (ret < 0)
+			break;
+
+        /* 处理惊群就在这里了
+             其中 nr_exclusive 是以 exclusive 方式唤醒 task 的个数
+             注意我们上边的调用栈中调用 __wake_up_common 时， nr_exclusive 对应的参数是1
+             也就是说希望在所有设置了 EXCLUSIVE 标记的 task 中选一个唤醒。
+             这个被唤醒的 task  就是队列中最前边那个 exclusive 的 task
+        */
+		if (ret && (flags & WQ_FLAG_EXCLUSIVE) && !--nr_exclusive)
+			break;
+
+		if (bookmark && (++cnt > WAITQUEUE_WALK_BREAK_CNT) &&
+				(&next->entry != &wq_head->head)) {
+			bookmark->flags = WQ_FLAG_BOOKMARK;
+			list_add_tail(&bookmark->entry, &next->entry);
+			break;
+		}
+	}
+
+	return nr_exclusive;
+}
+```
+
+<br>
+
+## 6. 总结
+----
+
+<br>
+
+1. epoll 的核心是把所有触发事件的 fd 设备，存储到了一个list 里边 rdllink，用来避免遍历所有监听的fd。因为 epoll 要监听的fd 没有数量限制。如果被监听的 fd 太多，那遍历所有就效率太低了。
+
+2. 注意虽然有rdllink ，但这个 list 中的fd 并不一定都返回给用户空间。因为还要对这个 list 中的 fd 的文件，依次执行 poll 操作，以判断是否 “真的有我们关心的设备状态，以及查询最新的设备状态”。这里也就是 LT ，ET 的区别了。LT 比 ET 低效的原因也就是：
+   
+   epoll，对于已经触发过事件的fd，会不断循环添加到 rdllink 里边，也就是每次调用都会 file->poll() 一下上次有事件触发的设备，看看用户有没有处理。最好的情况下，也会比 ET 多 1 次 file->poll() 操作。
+
+
+
+
+
+
 
 <br><br><br>
 

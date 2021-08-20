@@ -314,17 +314,22 @@ SYSCALL_DEFINE5(select, ...)
     }
     ```
 
-    其中 sock_def_wakeup 的调用栈如下；
+    其中 sock_def_readable 的调用栈如下；
     ``` cpp
-        sock_def_wakeup()
+    tcp_data_queue()
+    |
+    | -> tcp_data_ready()
             |
-            | -> wake_up_interruptible_all()
+            | -> sk->sk_data_ready(sk) ( 即：sock_def_readable)
                     |
-                    | -> __wake_up()
+                    | -> wake_up_interruptible_sync_poll() 
                             |
-                            | -> __wake_up_common_lock()
+                            | -> __wake_up_sync_key((x), TASK_INTERRUPTIBLE, 1, poll_to_key(m))
+                                // 注意： 这个函数调用中 nr_exclusive 传的是1
                                     |
-                                    | -> __wake_up_common()
+                                    | -> __wake_up_common_lock()
+                                            |
+                                            | -> __wake_up_common()
     ```
 
     最核心的就是 __wake_up_common 方法, 里边会遍历等待队列中所有的entry， 挨个唤醒。
