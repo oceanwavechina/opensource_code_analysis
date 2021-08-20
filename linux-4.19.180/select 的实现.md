@@ -471,7 +471,7 @@ SYSCALL_DEFINE5(select, ...)
 
 ## 参考文档
 
-* [tcp协议栈处理各种事件的分析] (https://www.iteye.com/blog/simohayha-559506)
+* [tcp协议栈处理各种事件的分析](https://www.iteye.com/blog/simohayha-559506)
 
 * [poll 源码概述](https://github.com/Liu-YT/IO-Multiplexing/blob/master/%E6%BA%90%E7%A0%81%E5%89%96%E6%9E%90/poll.md)
 
