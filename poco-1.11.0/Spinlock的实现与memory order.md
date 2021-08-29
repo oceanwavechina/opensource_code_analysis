@@ -1,4 +1,4 @@
-# Spinlock的实现
+# Spinlock的实现与memory order
 
 如 poco 注释所说，spinlock 比价适合于对小的代码块进行加锁，这个小指的是持有锁的时间短。
 
@@ -6,7 +6,7 @@
 
 <br>
 
-# 1. 实现流程
+## 1. 实现流程
 ----
 <br>
 
@@ -54,7 +54,7 @@ inline void SpinlockMutex::unlock()
 
 <br>
 
-# 2. TODO: 代码的执行顺序
+## 2. memory order
 ----
 <br>
 
@@ -96,11 +96,15 @@ perceived by the loads made by another CPU in the same order as the stores were
 committed.
 ```
 
+而 c++ 中不同的 memory order 则规定了哪些操作可以执行重排，那些不可以。
 
 <br><br><br>
 
-# 参考资料
+## 参考资料
 ----
 <br>
 
-* [memory-barriers](https://www.kernel.org/doc/Documentation/memory-barriers.txt)
+* [Memory model synchronization modes](http://gcc.gnu.org/wiki/Atomic/GCCMM/AtomicSync)
+* [详解c++ atomic原子编程中的Memory Order](https://www.jb51.net/article/214304.htm#_label4)
+* [Memory Consistency Models: A Tutorial](https://www.cs.utexas.edu/~bornholt/post/memory-models.html)
+* [Memory barriers](https://mariadb.org/wp-content/uploads/2017/11/2017-11-Memory-barriers.pdf)
