@@ -126,6 +126,62 @@ SYSCALL_DEFINE5(select, ...)
 
 其核心在最后两个函数  ```do_select()``` 和 ```vfs_poll()```。
 
+先看一下 ```core_sys_select()``` 函数：
+
+``` cpp
+int core_sys_select(int n, fd_set __user *inp, fd_set __user *outp,
+			   fd_set __user *exp, struct timespec64 *end_time)
+{
+    //  从用户空间拷贝数据到内核空间
+	if ((ret = get_fd_set(n, inp, fds.in)) ||
+	    (ret = get_fd_set(n, outp, fds.out)) ||
+	    (ret = get_fd_set(n, exp, fds.ex)))
+		goto out;
+	zero_fd_set(n, fds.res_in);
+	zero_fd_set(n, fds.res_out);
+	zero_fd_set(n, fds.res_ex);
+
+	ret = do_select(n, &fds, end_time);
+
+    //  从内核空间拷贝数据到用户空间
+	if (set_fd_set(n, inp, fds.res_in) ||
+	    set_fd_set(n, outp, fds.res_out) ||
+	    set_fd_set(n, exp, fds.res_ex))
+		ret = -EFAULT;
+
+	return ret;
+}
+
+static inline
+int get_fd_set(unsigned long nr, void __user *ufdset, unsigned long *fdset)
+{
+	nr = FDS_BYTES(nr);
+	if (ufdset)
+		return copy_from_user(fdset, ufdset, nr) ? -EFAULT : 0;
+
+	memset(fdset, 0, nr);
+	return 0;
+}
+
+static inline unsigned long __must_check
+set_fd_set(unsigned long nr, void __user *ufdset, unsigned long *fdset)
+{
+	if (ufdset)
+		return __copy_to_user(ufdset, fdset, FDS_BYTES(nr));
+	return 0;
+}
+```
+
+我们可以看到 select 每次调用其实是分成了 3 步：
+
+1. 把 fd 和 时间信息从用户空间拷贝到内核空间
+2. 等待事件发生
+3. 把事件结果从内核空间拷贝回用户空间
+
+这里的用户和内核态的数据拷贝会对性能造成比较大的影响：因为往往需要监听的fd，大部分是不动的，但是每次调用都要重新设置，也就是把数据拷贝和等待事件两个操作混在一起了。这里也是 epoll 优化的地方
+
+<br>
+
 其中 do_select 的逻辑如下；
 
 <br>

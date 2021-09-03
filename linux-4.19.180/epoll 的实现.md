@@ -68,6 +68,8 @@ static int do_epoll_create(int flags)
     // 分配 fd， 并根据 struct eventpoll 创建 inode 信息
 	fd = get_unused_fd_flags(O_RDWR | (flags & O_CLOEXEC));
     ......
+
+    // 这里会把 struct eventpoll *ep 对象存储到 file 里边
 	file = anon_inode_getfile("[eventpoll]", &eventpoll_fops, ep, O_RDWR | (flags & O_CLOEXEC));
     ......
 	fd_install(fd, file);
@@ -118,17 +120,33 @@ struct eventpoll {
 };
 ```
 
+有几个对象的关系这里先梳理下：
+1. 当执行 epoll_create 后，会返回一个fd，也就是对应操作系统的一个文件 ```struct file* file```
+
+2. 作为 epoll 的核心对象 ```struct eventpoll```, 会以 private_data 的成员存储在 file 对象里边
+   
+   即 ```file->private_data = priv;``` (fs/anon_inode.c:70 anon_inode_getfile())
+
+3. 所以当给定 epoll fd 后其查找流程为：“”
+
+    - 先根据 ```fd``` 找到 ```struct file* file``` 对象
+    - 根据 ```struct file* file``` 对象找到 ```struct eventpoll```, 即 ```file->private_data```
+
+4. 而我们的监听列表等信息，都存储在 ```struct eventpoll``` 里边。
+
+
 <br>
 
-## 2. epoll_ctl: 增删改 需要监听的fd
+## 2. epoll_ctl: 注册事件
 ----
 
 <br>
 
-这个函数是跟 select 不一样的地方。在 select 机制中，每次调用 select 其实是同时执行了两个操作：
+这个函数是跟 select 不一样的地方。在 select 机制中，每次调用 select 其实是同时执行了3个操作：
 
 1. 添加要监听的 fd （用户态到内核态的数据拷贝）
 2. 轮询所有被监听的 fd 的事件
+3. 把有事件发生的fd返回 (内核态到用户态的数据拷贝)
 
 每次全量添加 fd， 也就成了影响 select 性能的一个地方。所以在 epoll 中把以上这两个操作拆开成了两个独立的步骤。所以在 wait 时操作也就减少了。
 
@@ -139,6 +157,84 @@ struct eventpoll {
     这个接口保存了事件的所有信息。epoll 实现中每个被监听的 fd 都对应一个 ```struct epitem```。
 
 2. 把 epitem 添加的红黑树里边。
+
+3. 把当前 task 添加到监听文件的唤醒列表里边
+
+如下是 ep_insert 的实现：
+
+``` cpp
+static int ep_insert(struct eventpoll *ep, const struct epoll_event *event,
+		     struct file *tfile, int fd, int full_check)
+{
+
+	// 红黑树里边是所有需要监听的fd
+    // 所以要把新加的fd 放到 红黑树里边
+	ep_rbtree_insert(ep, epi);
+
+
+	// 这里是初始化回调函数，也即是当设备有事件发生的时候会调用这个函数
+    // 这个回调函数也就是把我们当前 task 插入到 设备等待队列的关键
+    // 回调函数的具体内容我们下边看
+	epq.epi = epi;
+	init_poll_funcptr(&epq.pt, ep_ptable_queue_proc);
+
+    //  这里会主动 poll 一下设备
+    //  在poll 的过程中会 调用我们刚刚设置的回调函数 ep_ptable_queue_proc
+    //  这个回调函数就会把当前 task 插入到 设备的等待队列中
+	revents = ep_item_poll(epi, &epq.pt, 1);
+}
+```
+
+那个关键的回调函数实现如下，看函数注释就很清楚了：
+
+``` cpp
+/*
+ * This is the callback that is used to add our wait queue to the
+ * target file wakeup lists.
+ */
+static void ep_ptable_queue_proc(struct file *file, wait_queue_head_t *whead,
+				 poll_table *pt)
+{
+
+    /* 这里有几个参数需要注意下：
+        whead：
+            这个是设备内部的链表，也就是当设备有事件发生时，会唤醒这个链表上的task
+    */
+
+	struct epitem *epi = ep_item_from_epqueue(pt);
+	struct eppoll_entry *pwq;
+
+	if (epi->nwait >= 0 && (pwq = kmem_cache_alloc(pwq_cache, GFP_KERNEL))) {
+        // 这里还有个回调函数，这个是当有事件时，设备会调用这个函数
+		init_waitqueue_func_entry(&pwq->wait, ep_poll_callback);
+		pwq->whead = whead;
+		pwq->base = epi;
+
+        // 下边的 add_wait_queue* 就是把当前 eppoll_entry，添加到设备的等待队列中
+		if (epi->event.events & EPOLLEXCLUSIVE)
+			add_wait_queue_exclusive(whead, &pwq->wait);
+		else
+			add_wait_queue(whead, &pwq->wait);
+		list_add_tail(&pwq->llink, &epi->pwqlist);
+		epi->nwait++;
+	} else {
+		/* We have to signal that an error occurred */
+		epi->nwait = -1;
+	}
+}
+```
+
+关于如何注册当前task (subscriber) 到 设备(publisher) 其调用栈如下
+
+``` cpp
+ep_item_poll()
+    |
+    |-> poll_wait()
+        |
+        |-> p->_qproc(filp, wait_address, p);
+            // 即 ep_ptable_queue_proc()  eventpoll.c:1236
+
+```
 
 
 <br>
@@ -163,6 +259,8 @@ SYSCALL_DEFINE4(epoll_wait)
 <br>
 
 ep_poll 的主题逻辑如下：
+
+可以看到 每次调用 eppoll_wait 拿掉了从用户空间到内核空间的数据拷贝，同时返回的时候只返回已经触发的事件
 
 ``` cpp
 static int ep_poll(struct eventpoll *ep, struct epoll_event __user *events,
@@ -280,9 +378,25 @@ check_events:
 如下：
 
 ``` cpp
+
+// 检查有没有事件发生
 static inline int ep_events_available(struct eventpoll *ep)
 {
 	return !list_empty(&ep->rdllist) || ep->ovflist != EP_UNACTIVE_PTR;
+}
+
+// 挨个 poll 有事件的设备
+static int ep_send_events(struct eventpoll *ep,
+			  struct epoll_event __user *events, int maxevents)
+{
+	struct ep_send_events_data esed;
+
+	esed.maxevents = maxevents;
+	esed.events = events;
+
+    // 遍历 ready list, 对所有有事件发生的fd 执行 poll 操作
+	ep_scan_ready_list(ep, ep_send_events_proc, &esed, 0, false);
+	return esed.res;
 }
 ```
 
