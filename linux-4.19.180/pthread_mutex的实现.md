@@ -1,6 +1,6 @@
 # pthread_mutex的实现
 
-pthread_mutex 的实现在 glibc 库中，支持可重入和不可重入。pthread_mutex 用到了 CAS 操作更新锁的状态。同时会自适应的选择自旋方式还是内核调用睡眠方式。
+pthread_mutex 的实现在 glibc 库中，支持可重入和不可重入。pthread_mutex 用到了 CAS 操作更新锁的状态
 
 
 <br>
@@ -227,9 +227,9 @@ private:
 
 根据上述状态，当锁的持有者是唯一的持有者时，如果它释放锁，即
 
-    ``` cpp
+``` cpp
     int oldval = compare_and_swap(val, 1, 0);
-    ```
+```
 
 1. 如果发现 oldval == 1，说明除了它，没有人想获取锁，此时就不用调用 futex_wake() 了，节省了系统调用的开销
 
