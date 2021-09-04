@@ -64,10 +64,84 @@ struct __pthread_mutex_s
 
 pthread_mutext 的实现在 ```glibc/nptl/pthread_mutex_lock.c:72```。
 
+我们先看一下正常加锁的调用栈：
+
+``` cpp
+int PTHREAD_MUTEX_LOCK (pthread_mutex_t *mutex)
+    |
+    |-> LLL_MUTEX_LOCK_OPTIMIZED (mutex);
+        |
+        |-> lll_mutex_lock_optimized (mutex)
+            |
+            |-> lll_lock (mutex->__data.__lock, private);
+                |
+                |-> __lll_lock (&(futex), private)
+                    |
+                    |-> atomic_compare_and_exchange_bool_acq (__futex, 1, 0)))  // 先尝试在用户空间加一下锁
+                    |-> __lll_lock_wait (__futex, private); // 上一步的加锁尝试失败，需要进入等待
+```
+
+其核心也就是 ```___lll_lock_wait()``` 函数：
+
+``` cpp
+void
+__lll_lock_wait (int *futex, int private)
+{
+  if (atomic_load_relaxed (futex) == 2)
+    goto futex;
+
+  while (atomic_exchange_acquire (futex, 2) != 0)
+    {
+    futex:
+      LIBC_PROBE (lll_lock_wait, 1, futex);
+
+      //这里最终会进行系统调用: futex
+      futex_wait ((unsigned int *) futex, 2, private); /* Wait if *futex == 2.  */
+    }
+}
+```
+
+其流程如下：
+
 1. 加锁机制是使用 CAS 操作对 __lock 进行尝试更新，如果更新成功，说明加锁成功，直接返回。
+
 2. 否则执行 futex 系统调用切换到 kernel， 进入休眠等待。
+
 3. 当 mutex 被释放时，当前 task 被唤醒，再次执行上述检测机制
 
+
+<br>
+
+## 3. 解锁机制
+----
+<br>
+
+我们只看一下关键的部分 ```sysdeps/nptl/lowlevellock.h:145``` ，如下
+
+``` cpp
+#define __lll_unlock(futex, private)					\
+  ((void)								\
+  ({									\
+     int *__futex = (futex);						\
+     int __private = (private);						\
+     int __oldval = atomic_exchange_rel (__futex, 0);			\
+     if (__glibc_unlikely (__oldval > 1))				\
+       {								\
+         if (__builtin_constant_p (private) && (private) == LLL_PRIVATE) \
+           __lll_lock_wake_private (__futex);                           \
+         else                                                           \
+           __lll_lock_wake (__futex, __private);			\
+       }								\
+   }))
+```
+
+可以看到里边有根据 ```__oldval > 1``` 的判断。这个其实是一个优化的技巧。在解释这个技巧前，我们先看一下 futex 这个系统调用
+
+<br>
+
+## 4. futex 系统调用
+----
+<br>
 
 关于 futex， 这个是把当前 task 陷入等待状态，直到等待的事件触发。比如锁被释放
 
@@ -78,9 +152,94 @@ DESCRIPTION
        futex() operations can be used to wake any processes or threads waiting for a particular condition.
 ```
 
+其函数原型如下：
+
+``` cpp
+    int futex(int *uaddr, int futex_op, int val,
+                 const struct timespec *timeout,   /* or: uint32_t val2 */
+                 int *uaddr2, int val3);
+```
+
+这个函数有个比较 tricky 的地方：其中第三个参数 val 为当前调用者期望的值，也就是说如果当前值 *uaddr == 0 的情况下：
+
+1. 我们如果执行以下调用：
+
+    futex(uaddr, wait, 0, ...) 
+    
+    那当前 task 就会进入休眠等待状态，直到 *uaddr 的值发生改变(即 != 0)
+
+1. 我们如果执行以下调用：
+
+    futex(uaddr, wait, 1, ...) 
+    
+    那当前 task 就会立即返回 EWOILDBLOCK，而不会休眠等待状态
+
+
 <br>
 
-## 3. 锁 与 中断
+## 4. __lock 为什么会有三中状态 ？
+----
+<br>
+
+有了 futex 函数的基础，我们看一下为什么需要这 3 个状态？
+
+我们先从最原始的想法开始：
+
+``` cpp
+class mutex {
+public:
+    mutex(): val(0) {}
+
+    void lock() {
+        while(compare_and_swap(val, 0, 1) != 0) {
+            // 等待变成 非1
+            futex_wait(&val, 1);
+        }
+    }
+
+    void unlock() {
+        compare_and_swap(val, 1, 0)
+        // 唤醒其他等待的 task
+        futex_wake(&val, 0);
+    }
+
+private:
+    int val;
+};
+```
+
+能看到上述代码的性能问题吗？
+
+* 在 unlock 的时候，会必然调用 futex_wake() 系统调用，即时当前没有其他线程在等待，这样会造成不必要的消耗，因为是系统调用
+
+所以才有了 pthread_mutex 中 3 种 状态的转换，就是为了尽量减少不必要的系统调用
+
+先说一下 ```__pthread_mutex_s.__lock``` 这个变量的状态转换，对于通过 CAS 操作检测这个变量的 task 来说：
+
+- 如果 CmpAndChg(__lock, 0, 1) 
+  
+  - 返回值(原有值) 为 0，说明之前锁没有被任何人持有，此时我们获得了锁，直接返回。
+
+  - 返回值(原有值) 为 1，说明有人正在持有锁，**但是没有其他waiters**， 也就是我们是第一个waiter
+
+  - 返回值(原有值) 为 2，说明有人正在持有锁，**且已经有其他waiters 在等待**
+
+
+根据上述状态，当锁的持有者是唯一的持有者时，如果它释放锁，即
+
+    ``` cpp
+    int oldval = compare_and_swap(val, 1, 0);
+    ```
+
+1. 如果发现 oldval == 1，说明除了它，没有人想获取锁，此时就不用调用 futex_wake() 了，节省了系统调用的开销
+
+2. 如果发现 oldval == 2，说明除了它，还有其他人在等待锁，此时就需要调用 futex_wake() 唤醒其他人
+
+综上所述，通过加了一个新的状态，节省了昂贵的系统调用，由此带来的收益还是很划算的。
+
+<br>
+
+## 4. 锁 与 中断
 ----
 <br>
 
@@ -98,3 +257,5 @@ DESCRIPTION
 
 * [How pthread_mutex_lock is implemented](https://stackoverflow.com/questions/5095781/how-pthread-mutex-lock-is-implemented)
 * [what happens if Interrupts occur after mutex lock has been acquired](https://stackoverflow.com/questions/22218365/what-happens-if-interrupts-occur-after-mutex-lock-has-been-acquired)
+* [Basics of Futexes](https://eli.thegreenplace.net/2018/basics-of-futexes/)
+* Futexes are Tricky
