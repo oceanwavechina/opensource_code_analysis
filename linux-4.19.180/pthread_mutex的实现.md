@@ -177,7 +177,105 @@ DESCRIPTION
 
 <br>
 
-## 4. __lock 为什么会有三中状态 ？
+## 5. futex 的内核实现
+----
+<br>
+
+在锁的实现上，我们使用到的 futex 的逻辑有两个：
+
+* futex_wait: 这个是把当前 task 放到等待队列，然后进入休眠， 等 待*uaddr 的值发生改变时被唤醒
+
+* futex_wake: 这个是当 *uaddr 的值改变时，唤醒所有等待的 task
+
+
+futex 的实现在 ```kernel/futex.c:3920``` , 其调用栈如下：
+
+``` cpp
+SYSCALL_DEFINE6(futex, u32 __user *, uaddr, int, op, u32, val, ...)
+        |
+        |-> copy_from_user(&ts, utime, sizeof(ts)) // 拷贝超时时间
+        |-> do_futex(uaddr, op, val, tp, uaddr2, val2, val3)
+            |
+            |-> // switch op & FUTEX_CMD_MASK
+            |-> futex_wait(uaddr, flags, val, timeout, val3)
+            |-> futex_wake(uaddr, flags, val, val3);
+            |-> ......
+```
+
+其中 futex_wait 的实现如下：
+
+``` cpp
+static int futex_wait(u32 __user *uaddr, unsigned int flags, u32 val,
+		      ktime_t *abs_time, u32 bitset)
+{
+    // 设置超时时间
+	if (abs_time) {
+		to = &timeout;
+
+		hrtimer_init_on_stack(&to->timer, (flags & FLAGS_CLOCKRT) ?
+				      CLOCK_REALTIME : CLOCK_MONOTONIC,
+				      HRTIMER_MODE_ABS);
+		hrtimer_init_sleeper(to, current);
+		hrtimer_set_expires_range_ns(&to->timer, *abs_time,
+					     current->timer_slack_ns);
+	}
+
+retry:
+	/*
+	 * Prepare to wait on uaddr. On success, holds hb lock and increments
+	 * q.key refs.
+	 */
+	ret = futex_wait_setup(uaddr, val, flags, &q, &hb);
+	if (ret)
+		goto out;
+
+	/* queue_me and wait for wakeup, timeout, or a signal. */
+    // 把当前 task 放到 等待队列中
+	futex_wait_queue_me(hb, &q, to);
+
+	/* If we were woken (and unqueued), we succeeded, whatever. */
+	ret = 0;
+	/* unqueue_me() drops q.key ref */
+	if (!unqueue_me(&q))
+		goto out;
+	ret = -ETIMEDOUT;
+	if (to && !to->task)
+		goto out;
+
+	/*
+	 * We expect signal_pending(current), but we might be the
+	 * victim of a spurious wakeup as well.
+	 */
+	if (!signal_pending(current))
+		goto retry;
+
+	ret = -ERESTARTSYS;
+	if (!abs_time)
+		goto out;
+
+    // TODO??
+	restart = &current->restart_block;
+	restart->fn = futex_wait_restart;
+	restart->futex.uaddr = uaddr;
+	restart->futex.val = val;
+	restart->futex.time = *abs_time;
+	restart->futex.bitset = bitset;
+	restart->futex.flags = flags | FLAGS_HAS_TIMEOUT;
+
+	ret = -ERESTART_RESTARTBLOCK;
+
+out:
+	if (to) {
+		hrtimer_cancel(&to->timer);
+		destroy_hrtimer_on_stack(&to->timer);
+	}
+	return ret;
+}
+```
+
+<br>
+
+## 6. __lock 为什么会有三中状态 ？
 ----
 <br>
 
@@ -239,7 +337,7 @@ private:
 
 <br>
 
-## 4. 锁 与 中断
+## 7. 锁 与 中断
 ----
 <br>
 

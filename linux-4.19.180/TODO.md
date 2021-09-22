@@ -1,8 +1,7 @@
 # TODO
 
 1. inode 和 file-descriptor
-
-
+2. sendmsg 传递文件描述符
 
 
 <br><br><br>
