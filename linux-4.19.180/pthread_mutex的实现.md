@@ -137,6 +137,26 @@ __lll_lock_wait (int *futex, int private)
 
 可以看到里边有根据 ```__oldval > 1``` 的判断。这个其实是一个优化的技巧。在解释这个技巧前，我们先看一下 futex 这个系统调用
 
+我们在来看看 ```__lll_lock_wake()``` 的调用栈：
+
+``` cpp
+
+__lll_lock_wake (__futex, __private);
+    |
+    |-> lll_futex_wake (futex, 1, private);
+
+```
+
+其中 ```lll_futex_wake()`` 定义如下, 即，最多唤醒 nr 个 waiter：
+``` cpp
+/* Wake up up to NR waiters on FUTEXP.  */
+# define lll_futex_wake(futexp, nr, private)                             \
+  lll_futex_syscall (4, futexp,                                         \
+		     __lll_private_flag (FUTEX_WAKE, private), nr, 0)
+```
+
+也就是会唤醒 1 个 waiter 尝试获取锁，这样就避免了惊群的问题。
+
 <br>
 
 ## 4. futex 系统调用
@@ -173,6 +193,11 @@ DESCRIPTION
     futex(uaddr, wait, 1, ...) 
     
     那当前 task 就会立即返回 EWOILDBLOCK，而不会休眠等待状态
+
+当 futex 执行 wake 逻辑时， val 表示的是最多唤醒的个数。在 glibc 中(```nptl/pthread_mutex_unlock.c:177```) 
+
+```futex_wake ((unsigned int *) &mutex->__data.__lock, 1, private);```
+FUTEX_WAKE: 最多唤醒val个等待在uaddr上进程。
 
 
 <br>
