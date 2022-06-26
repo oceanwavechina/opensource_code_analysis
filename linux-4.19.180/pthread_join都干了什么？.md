@@ -317,7 +317,6 @@ __pthread_clockjoin_ex (pthread_t threadid, void **thread_return,
 2. detached thread 在线程创建的时候会执行 clean tcb 的操作， 而joinable thread 要在join的时候才会执行。
 
 
-
 <br><br><br>
 
 
